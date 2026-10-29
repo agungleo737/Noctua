@@ -19,27 +19,6 @@ from pathlib import Path
 from typing import Any, Literal
 from pydantic import BaseModel, Field, ValidationError
 
-from __future__ import annotations
-import argparse
-import html
-import http.server
-import ipaddress
-import json
-import shutil
-import socket
-import ssl
-import subprocess
-import sys
-import threading
-import unittest
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Literal
-from pydantic import BaseModel, Field, ValidationError
-
 # 1. KOMPATIBILITAS PYDANTIC & UTILS
 try:
     from pydantic import field_validator as _validator_lapangan
@@ -190,6 +169,7 @@ class PolicyDecision(BaseModel):
     allowed: bool
     reason: str
     execution_priority: Literal["low", "normal", "high", "critical"] = "critical"
+    sanitized_arguments: dict[str, Any] = Field(default_factory=dict)
 class EvidenceRef(BaseModel):
     type: str
     source: str
@@ -500,3 +480,305 @@ class PolicyEngine:
             execution_priority="critical",
             sanitized_arguments=argumen_tersanitasi,
         )
+# Mesin pemindai web
+
+HEADER_WAJIB_WEB = {
+    "Content-Security-Policy": (
+        "medium",
+        "Mencegah eksekusi skrip lintas situs (XSS) dan injeksi konten tak sah.",
+    ),
+    "Strict-Transport-Security": (
+        "low",
+        "Memaksa browser berkomunikasi hanya melalui HTTPS terenkripsi (HSTS).",
+    ),
+    "X-Frame-Options": (
+        "low",
+        "Melindungi halaman web dari serangan Clickjacking melalui elemen iframe.",
+    ),
+    "X-Content-Type-Options": (
+        "low",
+        "Mencegah MIME-sniffing berbahaya oleh browser (wajib bernilai 'nosniff').",
+    ),
+}
+
+JALUR_SENSITIF_UMUM = [
+    ("/.env", "high", "Berkas konfigurasi environment (.env) terbuka ke publik", ("db_", "app_env", "secret", "=")),
+    ("/.git/HEAD", "high", "Repositori kode sumber Git (.git) terekspos di web root", ("ref: refs/",)),
+    ("/backup.sql", "critical", "Cadangan basis data SQL (/backup.sql) dapat diunduh bebas", ("create table", "insert into", "mysqldump")),
+    ("/phpinfo.php", "medium", "Halaman diagnostik phpinfo() membocorkan konfigurasi server", ("php version", "zend engine")),
+    ("/admin/", "info", "Panel administrasi (/admin/) terdeteksi tanpa pembatasan IP", ("panel admin", "dashboard admin", "login admin")),
+    ("/robots.txt", "info", "Berkas robots.txt ditemukan dan memetakan direktori internal", ("user-agent:", "disallow:")),
+]
+
+POLA_GALAT_SQL = [
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark after the character string",
+    "quoted string not properly terminated",
+    "sqlite3::sqlexception",
+    "sqlite error",
+    "syntax error at or near",
+    "pg_query(): query failed",
+    "ora-01756",
+]
+class PemindaiKeamananWeb:
+    @staticmethod
+    def _ambil_respons_http(
+        url_tujuan: str, batas_waktu: int = 5
+    ) -> tuple[int, dict[str, str], list[str], str]:
+        permintaan = urllib.request.Request(
+            url_tujuan,
+            headers={"User-Agent": "AegisStrike-SecurityVerifier/0.2 (Authorized-Lab-Scan)"},
+        )
+        try:
+            # Buat SSL context
+            konteks_ssl = ssl.create_default_context()
+            konteks_ssl.check_hostname = False
+            konteks_ssl.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(permintaan, timeout=batas_waktu, context=konteks_ssl) as respons:
+                kode_status = respons.status
+                kamus_header = {k.lower(): v for k, v in respons.headers.items()}
+                daftar_cookie = respons.headers.get_all("Set-Cookie") or []
+                isi_mentah = respons.read(65536).decode("utf-8", errors="replace")
+                return kode_status, kamus_header, daftar_cookie, isi_mentah
+                
+        except urllib.error.HTTPError as galat_http:
+            kamus_header = (
+                {k.lower(): v for k, v in galat_http.headers.items()}
+                if galat_http.headers
+                else {}
+            )
+            daftar_cookie = (
+                galat_http.headers.get_all("Set-Cookie") if galat_http.headers else []
+            ) or []
+            isi_galat = galat_http.read(65536).decode("utf-8", errors="replace")
+            return galat_http.code, kamus_header, daftar_cookie, isi_galat
+            
+        except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as galat_jaringan:
+            # Handle connection error
+            return (
+                0,  # Status code 0 = connection failed
+                {},
+                [],
+                f"[CONNECTION_ERROR] {type(galat_jaringan).__name__}: {str(galat_jaringan)}",
+            )
+    @staticmethod
+    def pindai_port_terbuka(
+        nama_host: str, daftar_port: list[int], batas_waktu: int = 2
+    ) -> dict[str, Any]:
+        port_terbuka: list[dict[str, Any]] = []
+        for nomor_port in daftar_port:
+            soket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            soket.settimeout(min(batas_waktu, 2))
+            try:
+                hasil_koneksi = soket.connect_ex((nama_host, nomor_port))
+                if hasil_koneksi == 0:
+                    port_terbuka.append({"port": nomor_port, "state": "open"})
+            except OSError:
+                pass
+            finally:
+                soket.close()
+        jalur_nmap = shutil.which("nmap")
+        info_adapter = "socket_python_bawaan"
+        if jalur_nmap:
+            info_adapter = f"socket_python + nmap_tersedia ({jalur_nmap})"
+        return {
+            "host": nama_host,
+            "ports_scanned": daftar_port,
+            "open_ports": port_terbuka,
+            "adapter": info_adapter,
+        }
+
+    @classmethod
+    def periksa_header_dan_cookie(
+        cls, url_sasaran: str, batas_waktu: int = 5
+    ) -> dict[str, Any]:
+        status_http, header_respons, daftar_cookie, _ = cls._ambil_respons_http(
+            url_sasaran, batas_waktu=batas_waktu
+        )
+        header_hilang: list[dict[str, str]] = []
+        for nama_header, (tingkat_bahaya, penjelasan) in HEADER_WAJIB_WEB.items():
+            if nama_header.lower() not in header_respons:
+                header_hilang.append(
+                    {
+                        "header": nama_header,
+                        "severity": tingkat_bahaya,
+                        "rekomendasi": penjelasan,
+                    }
+                )
+
+        cookie_lemah: list[dict[str, str]] = []
+        for untai_cookie in daftar_cookie:
+            nama_cookie = untai_cookie.split("=", 1)[0].strip()
+            cookie_kecil = untai_cookie.lower()
+            atribut_kurang: list[str] = []
+            if "httponly" not in cookie_kecil:
+                atribut_kurang.append("HttpOnly")
+            if "samesite" not in cookie_kecil:
+                atribut_kurang.append("SameSite")
+            if url_sasaran.startswith("https://") and "secure" not in cookie_kecil:
+                atribut_kurang.append("Secure")
+            if atribut_kurang:
+                cookie_lemah.append(
+                    {
+                        "nama_cookie": nama_cookie,
+                        "raw_cookie": untai_cookie,
+                        "atribut_hilang": ", ".join(atribut_kurang),
+                    }
+                )
+        cors_terlalu_terbuka = header_respons.get("access-control-allow-origin") == "*"
+        banner_server = header_respons.get("server", "")
+        return {
+            "status_code": status_http,
+            "missing_headers": header_hilang,
+            "weak_cookies": cookie_lemah,
+            "wildcard_cors": cors_terlalu_terbuka,
+            "server_banner": banner_server,
+        }
+
+    @classmethod
+    def pindai_jalur_sensitif(
+        cls, url_dasar: str, batas_waktu: int = 5
+    ) -> dict[str, Any]:
+        terurai = urllib.parse.urlsplit(url_dasar)
+        akar_url = f"{terurai.scheme}://{terurai.netloc}"
+        temuan_jalur: list[dict[str, Any]] = []
+        for jalur_uji, tingkat_bahaya, keterangan, penanda_wajib in JALUR_SENSITIF_UMUM:
+            url_penuh = f"{akar_url}{jalur_uji}"
+            try:
+                status_http, _, _, cuplikan_isi = cls._ambil_respons_http(
+                    url_penuh, batas_waktu=batas_waktu
+                )
+                isi_kecil = cuplikan_isi.lower()
+                cocok_penanda = any(penanda in isi_kecil for penanda in penanda_wajib)
+                if status_http == 200 and cocok_penanda:
+                    temuan_jalur.append(
+                        {
+                            "path": jalur_uji,
+                            "url": url_penuh,
+                            "status_code": status_http,
+                            "severity": tingkat_bahaya,
+                            "description": keterangan,
+                            "snippet": cuplikan_isi[:140].strip().replace("\n", " | "),
+                        }
+                    )
+            except Exception:
+                continue
+        return {"base_url": akar_url, "exposed_paths": temuan_jalur}
+
+    @classmethod
+    def verifikasi_refleksi_xss(
+        cls, url_sasaran: str, parameter_uji: str = "q", batas_waktu: int = 5
+    ) -> dict[str, Any]:
+        penanda_canary = "AegisCanary9912<\"'>"
+        terurai = urllib.parse.urlsplit(url_sasaran)
+        kueri_awal = dict(urllib.parse.parse_qsl(terurai.query))
+        kueri_awal[parameter_uji] = penanda_canary
+        kueri_baru = urllib.parse.urlencode(kueri_awal)
+        url_uji = urllib.parse.urlunsplit(
+            (terurai.scheme, terurai.netloc, terurai.path or "/", kueri_baru, "")
+        )
+        status_http, _, _, isi_halaman = cls._ambil_respons_http(url_uji, batas_waktu=batas_waktu)
+        terpantul_mentah = penanda_canary in isi_halaman
+        terpantul_aman = html.escape(penanda_canary) in isi_halaman
+        cuplikan_bukti = ""
+        if terpantul_mentah:
+            posisi = isi_halaman.find(penanda_canary)
+            awal = max(0, posisi - 40)
+            akhir = min(len(isi_halaman), posisi + len(penanda_canary) + 40)
+            cuplikan_bukti = isi_halaman[awal:akhir].strip()
+        return {
+            "tested_url": url_uji,
+            "parameter": parameter_uji,
+            "canary_payload": penanda_canary,
+            "status_code": status_http,
+            "vulnerable_unencoded_reflection": terpantul_mentah,
+            "properly_escaped": terpantul_aman,
+            "proof_snippet": cuplikan_bukti,
+        }
+
+    @classmethod
+    def verifikasi_indikator_sqli(
+        cls, url_sasaran: str, parameter_uji: str = "id", batas_waktu: int = 5
+    ) -> dict[str, Any]:
+        """Memverifikasi indikator kerentanan SQL Injection berdasarkan perbedaan respons & galat sintaks SQL."""
+        terurai = urllib.parse.urlsplit(url_sasaran)
+        kueri_dasar = dict(urllib.parse.parse_qsl(terurai.query))
+
+        # 1. Request normal (baseline)
+        kueri_dasar[parameter_uji] = "1"
+        url_normal = urllib.parse.urlunsplit(
+            (
+                terurai.scheme,
+                terurai.netloc,
+                terurai.path or "/",
+                urllib.parse.urlencode(kueri_dasar),
+                "",
+            )
+        )
+        status_normal, _, _, isi_normal = cls._ambil_respons_http(
+            url_normal, batas_waktu=batas_waktu
+        )
+
+        # 2. Request uji karakter kutip tunggal (diagnostic probe)
+        kueri_dasar[parameter_uji] = "1'"
+        url_probe = urllib.parse.urlunsplit(
+            (
+                terurai.scheme,
+                terurai.netloc,
+                terurai.path or "/",
+                urllib.parse.urlencode(kueri_dasar),
+                "",
+            )
+        )
+        status_probe, _, _, isi_probe = cls._ambil_respons_http(
+            url_probe, batas_waktu=batas_waktu
+        )
+
+        isi_probe_kecil = isi_probe.lower()
+        pola_cocok: list[str] = []
+        for pola_sql in POLA_GALAT_SQL:
+            if pola_sql in isi_probe_kecil and pola_sql not in isi_normal.lower():
+                pola_cocok.append(pola_sql)
+
+        cuplikan_galat = ""
+        if pola_cocok:
+            indeks = isi_probe_kecil.find(pola_cocok[0])
+            cuplikan_galat = isi_probe[max(0, indeks - 20) : min(len(isi_probe), indeks + 120)].strip()
+
+        return {
+            "baseline_url": url_normal,
+            "probe_url": url_probe,
+            "parameter": parameter_uji,
+            "baseline_status": status_normal,
+            "probe_status": status_probe,
+            "sql_error_detected": len(pola_cocok) > 0,
+            "matched_error_signatures": pola_cocok,
+            "proof_snippet": cuplikan_galat,
+            "sqlmap_binary_available": shutil.which("sqlmap") is not None,
+        }
+
+    @staticmethod
+    def periksa_konfigurasi_tls(nama_host: str, port: int = 443, batas_waktu: int = 5) -> dict[str, Any]:
+        """Memeriksa versi protokol TLS dan masa berlaku sertifikat."""
+        konteks_ssl = ssl.create_default_context()
+        try:
+            with socket.create_connection((nama_host, port), timeout=batas_waktu) as soket_tcp:
+                with konteks_ssl.wrap_socket(soket_tcp, server_hostname=nama_host) as soket_tls:
+                    versi_tls = soket_tls.version() or "unknown"
+                    sertifikat = soket_tls.getpeercert() or {}
+                    return {
+                        "host": nama_host,
+                        "port": port,
+                        "tls_supported": True,
+                        "tls_version": versi_tls,
+                        "weak_protocol": versi_tls in ("SSLv3", "TLSv1", "TLSv1.1"),
+                        "subject": str(sertifikat.get("subject", "")),
+                    }
+        except Exception as galat_tls:
+            return {
+                "host": nama_host,
+                "port": port,
+                "tls_supported": False,
+                "error": str(galat_tls),
+            }
