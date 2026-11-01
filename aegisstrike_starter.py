@@ -382,6 +382,79 @@ POLA_KARAKTER_BAHAYA = (
     "%0a", "%0d", "%00",
 )
 
+# Mencatat seluruh keputusan sistem
+class AuditLogger:
+    def __init__(self, scan_id: str, log_dir: str = "audit_logs"):
+        self.scan_id = scan_id
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        self.log_file = self.log_dir / f"audit_{scan_id}.json"
+        self.events: list[dict[str, Any]] = []
+        self.start_time = datetime.now(timezone.utc)
+    
+    def log_event(self, event_type: str, details: dict[str, Any] | None = None):
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "scan_id": self.scan_id,
+            "event_type": event_type,
+            "details": details or {},
+        }
+        self.events.append(event)
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        print(f"Audit {event_type}: {json.dumps(details or {}, ensure_ascii=False)[:100]}")
+    def log_scan_started(self, target: str, environment: str = "unknown"):
+        self.log_event("scan_started", {"target": target, "environment": environment})
+    def log_scan_completed(self, total_findings: int, duration_seconds: float):
+        self.log_event("scan_completed", {"total_findings": total_findings, "duration_seconds": round(duration_seconds, 2)})
+    def log_action_proposed(self, tool_name: str, arguments: dict[str, Any], rationale: str = ""):
+        self.log_event("action_proposed", {"tool_name": tool_name, "arguments": arguments, "rationale": rationale[:200]})
+    def log_action_allowed(self, tool_name: str, reason: str, evasion_level: int = 0):
+        self.log_event("action_allowed", {"tool_name": tool_name, "reason": reason, "evasion_level": evasion_level})
+    def log_action_denied(self, tool_name: str, reason: str):
+        self.log_event("action_denied", {"tool_name": tool_name, "reason": reason})
+    def log_action_executed(self, tool_name: str, status: str, result_summary: str = ""):
+        self.log_event("action_executed", {"tool_name": tool_name, "status": status, "result_summary": result_summary[:200]})
+    def log_finding_created(self, finding_id: str, severity: str, title: str, confidence: float):
+        self.log_event("finding_created", {"finding_id": finding_id, "severity": severity, "title": title, "confidence": confidence})
+    
+    def get_summary(self) -> dict[str, Any]:
+        event_counts = {}
+        for event in self.events:
+            event_type = event["event_type"]
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+        duration = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+        return {
+            "scan_id": self.scan_id,
+            "total_events": len(self.events),
+            "event_counts": event_counts,
+            "duration_seconds": round(duration, 2),
+            "log_file": str(self.log_file),
+        }
+    
+    def print_summary(self):
+        summary = self.get_summary()
+        print("Audit log summary")
+        print(f"Scan ID        : {summary['scan_id']}")
+        print(f"Total Events   : {summary['total_events']}")
+        print(f"Duration       : {summary['duration_seconds']}s")
+        print(f"Log File       : {summary['log_file']}")
+        print("\nEvent Breakdown:")
+        for event_type, count in summary['event_counts'].items():
+            print(f"  {event_type:<20} : {count}")
+
+    def simpan_laporan_markdown(self, target_url: str, daftar_temuan: list[Finding], nama_file: str = "scan_report.md") -> str:
+        summary = self.get_summary()
+        teks = f"# Laporan Scan {target_url}\n\n"
+        teks += f"Scan ID: {self.scan_id}\nDurasi: {summary['duration_seconds']}s\nTotal Temuan: {len(daftar_temuan)}\n\n"
+        teks += "## Daftar Temuan\n\n"
+        for t in daftar_temuan:
+            teks += f"### {t.finding_id} {t.title} ({t.severity})\n"
+            teks += f"PoC: {t.bukti_teknis_poc}\n"
+            teks += f"Solusi: {t.recommendation}\n\n"
+        Path(nama_file).write_text(teks, encoding="utf-8")
+        return nama_file
+
 class PolicyEngine:
     @staticmethod
     def evaluasi(
@@ -714,6 +787,7 @@ class MesinVerifikasiTemuan:
         hasil_header: dict[str, Any], hasil_jalur: dict[str, Any],
         hasil_xss: dict[str, Any], hasil_sqli: dict[str, Any],
         hasil_tls: dict[str, Any] | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> list[Finding]:
         daftar_temuan: list[Finding] = []
         nomor_urut = 1
@@ -736,6 +810,11 @@ class MesinVerifikasiTemuan:
                 recommendation="Gunakan Prepared Statements / Parameterized Queries pada seluruh kueri SQL dan matikan tampilan pesan galat database mentah ke pengguna.",
                 requires_human_review=True,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", "critical",
+                    f"Indikator Celah SQL Injection pada Parameter '{hasil_sqli['parameter']}'", 0.95,
+                )
 
         # Reflected XSS
         if hasil_xss.get("vulnerable_unencoded_reflection"):
@@ -749,6 +828,11 @@ class MesinVerifikasiTemuan:
                 recommendation="Terapkan kontekstual HTML output encoding pada seluruh input pengguna dan aktifkan header Content-Security-Policy.",
                 requires_human_review=True,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", "high",
+                    f"Reflected Cross-Site Scripting (XSS) Terverifikasi pada Parameter '{hasil_xss['parameter']}'", 0.96,
+                )
 
         # Exposed Sensitive Paths
         for item_jalur in hasil_jalur.get("exposed_paths", []):
@@ -762,6 +846,10 @@ class MesinVerifikasiTemuan:
                 recommendation=f"Blokir akses publik ke '{item_jalur['path']}' melalui konfigurasi web server Nginx/Apache dan pindahkan berkas sensitif ke luar document root.",
                 requires_human_review=False,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", item_jalur["severity"], item_jalur["description"], 0.98,
+                )
 
         # Weak Cookies
         for info_cookie in hasil_header.get("weak_cookies", []):
@@ -775,6 +863,11 @@ class MesinVerifikasiTemuan:
                 recommendation="Tambahkan atribut HttpOnly, Secure, dan SameSite=Lax/Strict pada seluruh cookie sesi.",
                 requires_human_review=False,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", "medium",
+                    f"Cookie Sesi '{info_cookie['nama_cookie']}' Tidak Memiliki Atribut Keamanan Lengkap", 0.99,
+                )
 
         # Missing Security Headers
         daftar_hilang = hasil_header.get("missing_headers", [])
@@ -790,6 +883,11 @@ class MesinVerifikasiTemuan:
                 recommendation="Tambahkan Content-Security-Policy, X-Frame-Options: DENY, X-Content-Type-Options: nosniff, dan Strict-Transport-Security pada konfigurasi server.",
                 requires_human_review=False,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", "low",
+                    f"Header Keamanan HTTP Belum Dikonfigurasi ({', '.join(nama_header_hilang)})", 0.99,
+                )
 
         # Open Ports
         daftar_port_buka = [str(p["port"]) for p in hasil_port.get("open_ports", [])]
@@ -804,6 +902,11 @@ class MesinVerifikasiTemuan:
                 recommendation="Pastikan hanya port layanan yang benar-benar dibutuhkan yang dapat diakses.",
                 requires_human_review=False,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", "info",
+                    f"Port Layanan Web Terbuka Terdeteksi ({', '.join(daftar_port_buka)})", 1.0,
+                )
 
         # TLS Misconfiguration
         if hasil_tls:
@@ -818,6 +921,11 @@ class MesinVerifikasiTemuan:
                     recommendation="Nonaktifkan SSLv3, TLSv1.0, dan TLSv1.1. Gunakan minimal TLSv1.2 dengan cipher suite yang kuat.",
                     requires_human_review=False,
                 ))
+                if audit_logger:
+                    audit_logger.log_finding_created(
+                        f"F-{nomor_urut-1:03d}", "high",
+                        f"Protokol TLS Lemah Terdeteksi: {hasil_tls['tls_version']}", 0.99,
+                    )
             elif hasil_tls.get("tls_supported") is False and hasil_tls.get("error"):
                 daftar_temuan.append(Finding(
                     scan_id=id_scan, target=target_utama, finding_id=buat_id_temuan(),
@@ -829,6 +937,10 @@ class MesinVerifikasiTemuan:
                     recommendation="Periksa validitas sertifikat TLS dan konfigurasi cipher suite pada server.",
                     requires_human_review=False,
                 ))
+                if audit_logger:
+                    audit_logger.log_finding_created(
+                        f"F-{nomor_urut-1:03d}", "medium", "Konfigurasi TLS Bermasalah", 0.90,
+                    )
 
         # CORS Wildcard
         if hasil_header.get("wildcard_cors"):
@@ -842,6 +954,10 @@ class MesinVerifikasiTemuan:
                 recommendation="Batasi 'Access-Control-Allow-Origin' hanya pada domain yang dipercaya. Jangan gunakan wildcard jika endpoint memproses kredensial atau data sensitif.",
                 requires_human_review=False,
             ))
+            if audit_logger:
+                audit_logger.log_finding_created(
+                    f"F-{nomor_urut-1:03d}", "medium", "CORS Terlalu Terbuka, Access-Control-Allow-Origin: *", 0.99,
+                )
 
         return daftar_temuan
 
@@ -929,10 +1045,12 @@ def jalankan_demo_scan_lengkap() -> int:
         max_duration_seconds=300,
         allow_redirects=False,
     )
-    keadaan_scan = ScanState(scan_id="SCAN-SEKOLAH-001", authorization_id=manifest_demo.authorization_id, status="running")
+    keadaan_scan = ScanState(scan_id="scan-target-001", authorization_id=manifest_demo.authorization_id, status="running")
+    audit_logger = AuditLogger(scan_id=keadaan_scan.scan_id)
+    audit_logger.log_scan_started(target=url_target_lab, environment="lab")
 
     try:
-        # Evaluasi rencana pemeriksaan lewat PolicyEngine
+        # Evaluasi rencana pemeriksaan lewat PolicyEngine + catat ke AuditLogger
         rencana_pemeriksaan = [
             ProposedAction(tool_name="scan_open_ports", arguments={"target_url": url_target_lab}, rationale="Memetakan port TCP layanan web yang terbuka."),
             ProposedAction(tool_name="check_security_headers", arguments={"target_url": url_target_lab}, rationale="Memeriksa header keamanan HTTP dan konfigurasi cookie sesi."),
@@ -943,22 +1061,34 @@ def jalankan_demo_scan_lengkap() -> int:
 
         print("\nEvaluasi Policy Engine (Deny-by-Default):")
         for aksi in rencana_pemeriksaan:
+            audit_logger.log_action_proposed(aksi.tool_name, aksi.arguments, aksi.rationale)
             keputusan = PolicyEngine.evaluasi(aksi, manifest_demo, keadaan_scan)
-            status_teks = "DIIZINKAN" if keputusan.allowed else "DITOLAK"
-            print(f"  - [{status_teks}] {aksi.tool_name:<24} -> {keputusan.reason}")
+            if keputusan.allowed:
+                audit_logger.log_action_allowed(aksi.tool_name, keputusan.reason, aksi.evasion_level)
+            else:
+                audit_logger.log_action_denied(aksi.tool_name, keputusan.reason)
+            status_teks = "Diizinkan" if keputusan.allowed else "Ditolak"
+            print(f"  {status_teks}: {aksi.tool_name} ({keputusan.reason})")
 
         # Contoh tool ilegal
         aksi_ilegal = ProposedAction(tool_name="exploit_reverse_shell", arguments={"target_url": url_target_lab}, rationale="Percobaan panggil tool eksploitasi destruktif di luar allowlist.")
+        audit_logger.log_action_proposed(aksi_ilegal.tool_name, aksi_ilegal.arguments, aksi_ilegal.rationale)
         keputusan_ilegal = PolicyEngine.evaluasi(aksi_ilegal, manifest_demo, keadaan_scan)
-        print(f"  - [DITOLAK ] {aksi_ilegal.tool_name:<24} -> {keputusan_ilegal.reason}")
+        audit_logger.log_action_denied(aksi_ilegal.tool_name, keputusan_ilegal.reason)
+        print(f"  Ditolak: {aksi_ilegal.tool_name} ({keputusan_ilegal.reason})")
 
-        # Jalankan pemindaian
-        print("\Menjalankan Pemindaian & Verifikasi Bukti Deterministik")
+        # Jalankan pemindaian + catat eksekusi ke AuditLogger
+        print("\nMenjalankan Pemindaian & Verifikasi Bukti Deterministik")
         hasil_port = PemindaiKeamananWeb.pindai_port_terbuka("127.0.0.1", [port_acak, 22])
+        audit_logger.log_action_executed("scan_open_ports", "completed", f"Open ports: {hasil_port.get('open_ports')}")
         hasil_header = PemindaiKeamananWeb.periksa_header_dan_cookie(url_target_lab)
+        audit_logger.log_action_executed("check_security_headers", "completed", f"HTTP status {hasil_header.get('status_code')}")
         hasil_jalur = PemindaiKeamananWeb.pindai_jalur_sensitif(url_target_lab)
+        audit_logger.log_action_executed("scan_web_paths", "completed", f"Exposed paths: {len(hasil_jalur.get('exposed_paths', []))}")
         hasil_xss = PemindaiKeamananWeb.verifikasi_refleksi_xss(url_target_lab, parameter_uji="q")
+        audit_logger.log_action_executed("verify_xss_reflection", "completed", f"Reflected: {hasil_xss.get('vulnerable_unencoded_reflection')}")
         hasil_sqli = PemindaiKeamananWeb.verifikasi_indikator_sqli(url_target_lab, parameter_uji="id")
+        audit_logger.log_action_executed("verify_sqli_indicators", "completed", f"SQLi error: {hasil_sqli.get('sql_error_detected')}")
         hasil_tls = PemindaiKeamananWeb.periksa_konfigurasi_tls("127.0.0.1", port_acak)
 
         # Generate temuan
@@ -966,15 +1096,26 @@ def jalankan_demo_scan_lengkap() -> int:
             id_scan=keadaan_scan.scan_id, target_utama=url_target_lab,
             hasil_port=hasil_port, hasil_header=hasil_header, hasil_jalur=hasil_jalur,
             hasil_xss=hasil_xss, hasil_sqli=hasil_sqli, hasil_tls=hasil_tls,
+            audit_logger=audit_logger,
         )
 
-        print(f"\nHasil Temuan Terverifikasi ({len(daftar_temuan)} Temuan Valid - Bebas False Positive):")
+        print(f"\nHasil Temuan Terverifikasi ({len(daftar_temuan)} temuan):")
         for temuan in daftar_temuan:
-            print(f"\n  [{temuan.finding_id}] [{temuan.severity.upper()}] {temuan.title}")
-            print(f"       Status Verifikasi : {temuan.status} (Confidence: {temuan.confidence})")
-            print(f"       Bukti PoC Teknis  : {temuan.bukti_teknis_poc}")
-            print(f"       Rekomendasi       : {temuan.recommendation}")
-        print("Seluruh alur pemindaian & verifikasi bukti selesai dengan aman.")
+            print(f"\n  {temuan.finding_id} ({temuan.severity}) {temuan.title}")
+            print(f"  Status      : {temuan.status} (Confidence: {temuan.confidence})")
+            print(f"  PoC         : {temuan.bukti_teknis_poc}")
+            print(f"  Rekomendasi : {temuan.recommendation}")
+        duration = (datetime.now(timezone.utc) - keadaan_scan.started_at).total_seconds()
+        audit_logger.log_scan_completed(len(daftar_temuan), duration)
+        audit_logger.print_summary()
+
+        # Simpan ke JSON dan Markdown
+        temuan_json = [model_ke_dict(f) for f in daftar_temuan]
+        Path("scan_results.json").write_text(json.dumps(temuan_json, indent=2, ensure_ascii=False), encoding="utf-8")
+        file_md = audit_logger.simpan_laporan_markdown(url_target_lab, daftar_temuan)
+        print(f"\nLaporan JSON tersimpan di: scan_results.json")
+        print(f"Laporan Markdown tersimpan di: {file_md}")
+        print("Pemindaian selesai.")
         return 0
     finally:
         server_lokal.shutdown()
@@ -997,46 +1138,59 @@ def jalankan_demo_scan_target_external(url_target: str) -> int:
         targets=[TargetRule(host=nama_host, ports=[port], allowed_schemes=[skema], allow_private_ip=False)],
         allowed_checks=list(semua_kategori_default), max_requests=500, max_duration_seconds=600, allow_redirects=True,
     )
-    keadaan_scan = ScanState(scan_id="SCAN-LIVE-001", authorization_id=manifest_live.authorization_id, status="running")
+    keadaan_scan = ScanState(scan_id="scan-001", authorization_id=manifest_live.authorization_id, status="running")
+    audit_logger = AuditLogger(scan_id=keadaan_scan.scan_id)
+    audit_logger.log_scan_started(target=url_target, environment="production")
 
     try:
         print("\nMenjalankan Pemindaian Live")
         print("Scanning ports")
         hasil_port = PemindaiKeamananWeb.pindai_port_terbuka(nama_host, [port, 80, 443, 8080, 8443])
+        audit_logger.log_action_executed("scan_open_ports", "completed", f"Open ports: {hasil_port.get('open_ports')}")
         print("Checking security headers")
         hasil_header = PemindaiKeamananWeb.periksa_header_dan_cookie(url_target)
+        audit_logger.log_action_executed("check_security_headers", "completed", f"HTTP status {hasil_header.get('status_code')}")
         print("Checking TLS configuration")
         hasil_tls = PemindaiKeamananWeb.periksa_konfigurasi_tls(nama_host, port)
+        audit_logger.log_action_executed("check_tls_configuration", "completed", f"TLS supported: {hasil_tls.get('tls_supported')}")
         print("Scanning sensitive paths")
         hasil_jalur = PemindaiKeamananWeb.pindai_jalur_sensitif(url_target)
+        audit_logger.log_action_executed("scan_web_paths", "completed", f"Exposed paths: {len(hasil_jalur.get('exposed_paths', []))}")
         print("Testing XSS reflection")
         hasil_xss = PemindaiKeamananWeb.verifikasi_refleksi_xss(url_target, parameter_uji="q")
+        audit_logger.log_action_executed("verify_xss_reflection", "completed", f"Reflected: {hasil_xss.get('vulnerable_unencoded_reflection')}")
         print("Testing SQL injection indicators")
         hasil_sqli = PemindaiKeamananWeb.verifikasi_indikator_sqli(url_target, parameter_uji="id")
+        audit_logger.log_action_executed("verify_sqli_indicators", "completed", f"SQLi error: {hasil_sqli.get('sql_error_detected')}")
 
         print("\nVerifikasi Temuan & Generate Laporan")
         daftar_temuan = MesinVerifikasiTemuan.verifikasi_semua(
             id_scan=keadaan_scan.scan_id, target_utama=url_target,
             hasil_port=hasil_port, hasil_header=hasil_header, hasil_jalur=hasil_jalur,
             hasil_xss=hasil_xss, hasil_sqli=hasil_sqli, hasil_tls=hasil_tls,
+            audit_logger=audit_logger,
         )
-        print(f"\nHasil: {len(daftar_temuan)} Temuan Terverifikasi Bebas False Positive:")
+        print(f"\nHasil: {len(daftar_temuan)} temuan terverifikasi:")
         if not daftar_temuan:
-            print(" Tidak ada kerentanan yang terdeteksi. Target terlihat aman.")
+            print("Tidak ada kerentanan yang terdeteksi.")
         else:
             for temuan in daftar_temuan:
-                print(f"\n  [{temuan.finding_id}] [{temuan.severity.upper()}] {temuan.title}")
-                print(f"       Confidence    : {temuan.confidence:.2f}")
-                print(f"       Category      : {temuan.category}")
-                print(f"       PoC           : {temuan.bukti_teknis_poc[:100]}")
-                print(f"       Recommendation: {temuan.recommendation}")
+                print(f"\n{temuan.finding_id} ({temuan.severity}) {temuan.title}")
+                print(f"Confidence    : {temuan.confidence:.2f}")
+                print(f"Category      : {temuan.category}")
+                print(f"PoC           : {temuan.bukti_teknis_poc[:100]}")
+                print(f"Recommendation: {temuan.recommendation}")
         print("Live target scan selesai.")
 
-        # Export ke JSON
+        # Export ke JSON dan Markdown
         temuan_json = [model_ke_dict(f) for f in daftar_temuan]
         with open("scan_results.json", "w", encoding="utf-8") as f:
             json.dump(temuan_json, f, indent=2, ensure_ascii=False)
-        print(f"\nSaved {len(temuan_json)} findings to 'scan_results.json'")
+        duration = (datetime.now(timezone.utc) - keadaan_scan.started_at).total_seconds()
+        audit_logger.log_scan_completed(len(daftar_temuan), duration)
+        audit_logger.print_summary()
+        file_md = audit_logger.simpan_laporan_markdown(url_target, daftar_temuan)
+        print(f"\nSaved {len(temuan_json)} findings to 'scan_results.json' and '{file_md}'")
         return 0
     except Exception as e:
         print(f"\nError Scan gagal: {str(e)}")
@@ -1237,7 +1391,7 @@ def jalankan_doctor() -> int:
     print("Scope Validator  : Siap (Proteksi SSRF, DNS Rebinding & IP Privat aktif)")
     for nama_biner in ("nmap", "nuclei", "nikto", "sqlmap"):
         lokasi = shutil.which(nama_biner) or "Belum terinstal (menggunakan pemindai Python bawaan)"
-        print(f"  - Adapter {nama_biner:<8} : {lokasi}")
+        print(f"  Adapter {nama_biner:<8} : {lokasi}")
     return 0
 
 
@@ -1265,8 +1419,8 @@ def jalankan_validasi_scope(jalur_manifest: str, url_diuji: str | None = None) -
         print(f"Kedaluwarsa   : {manifest_terurai.expires_at.isoformat()}")
     if url_diuji:
         hasil_cek_url = ScopeValidator.validasi_url_target(url_diuji, manifest_terurai)
-        label_status = "ALLOWED" if hasil_cek_url.allowed else "DENIED"
-        print(f"Uji URL [{label_status}]: {url_diuji} -> {hasil_cek_url.reason}")
+        label_status = "Diizinkan" if hasil_cek_url.allowed else "Ditolak"
+        print(f"Uji URL ({label_status}): {url_diuji} ({hasil_cek_url.reason})")
         return 0 if hasil_cek_url.allowed else 2
     return 0
 
