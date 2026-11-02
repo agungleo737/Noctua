@@ -1022,6 +1022,28 @@ class HandlerSimulasiWebSekolah(http.server.BaseHTTPRequestHandler):
         )
         self.wfile.write(isi_html.encode("utf-8"))
 
+class PlannerAgen:
+    URUTAN_TOOL = [
+        ("scan_open_ports", {}, "Memetakan port TCP layanan web yang terbuka."),
+        ("check_security_headers", {}, "Memeriksa header keamanan HTTP dan konfigurasi cookie sesi."),
+        ("scan_web_paths", {}, "Memindai berkas sensitif (.env, /admin) yang terekspos."),
+        ("verify_xss_reflection", {"parameter_uji": "q"}, "Memverifikasi refleksi input tanpa sanitasi pada parameter pencarian q."),
+        ("verify_sqli_indicators", {"parameter_uji": "id"}, "Memverifikasi kebocoran sintaks SQL pada parameter id."),
+    ]
+
+    @classmethod
+    def pilih_aksi_berikutnya(cls, konteks: PlannerContext) -> ProposedAction | None:
+        if konteks.remaining_budget.get("steps", 0) <= 0 or konteks.remaining_budget.get("requests", 0) <= 0:
+            return None
+        tool_sudah_jalan = {obs.get("type") for obs in konteks.observations}
+        daftar_izin = konteks.scope_summary.get("allowed_checks", [])
+        for nama_tool, arg_tambahan, alasan in cls.URUTAN_TOOL:
+            kategori = PEMETAAN_TOOL_KE_CEK.get(nama_tool)
+            if nama_tool not in tool_sudah_jalan and kategori in daftar_izin:
+                argumen = {"target_url": konteks.target_id, **arg_tambahan}
+                return ProposedAction(tool_name=nama_tool, arguments=argumen, rationale=alasan)
+        return None
+
 # Demo Function
 def jalankan_demo_scan_lengkap() -> int:
     server_lokal = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HandlerSimulasiWebSekolah)
@@ -1050,23 +1072,38 @@ def jalankan_demo_scan_lengkap() -> int:
     audit_logger.log_scan_started(target=url_target_lab, environment="lab")
 
     try:
-        # Evaluasi rencana pemeriksaan lewat PolicyEngine + catat ke AuditLogger
-        rencana_pemeriksaan = [
-            ProposedAction(tool_name="scan_open_ports", arguments={"target_url": url_target_lab}, rationale="Memetakan port TCP layanan web yang terbuka."),
-            ProposedAction(tool_name="check_security_headers", arguments={"target_url": url_target_lab}, rationale="Memeriksa header keamanan HTTP dan konfigurasi cookie sesi."),
-            ProposedAction(tool_name="scan_web_paths", arguments={"target_url": url_target_lab}, rationale="Memindai berkas sensitif (.env, /admin) yang terekspos."),
-            ProposedAction(tool_name="verify_xss_reflection", arguments={"target_url": url_target_lab, "parameter_uji": "q"}, rationale="Memverifikasi refleksi input tanpa sanitasi pada parameter pencarian q."),
-            ProposedAction(tool_name="verify_sqli_indicators", arguments={"target_url": url_target_lab, "parameter_uji": "id"}, rationale="Memverifikasi kebocoran sintaks SQL pada parameter id."),
-        ]
-
+        # Susun dan evaluasi rencana aksi secara dinamis lewat PlannerAgen + PolicyEngine
+        riwayat_observasi: list[dict[str, Any]] = []
         print("\nEvaluasi Policy Engine (Deny-by-Default):")
-        for aksi in rencana_pemeriksaan:
+        while True:
+            konteks = PlannerContext(
+                target_id=url_target_lab,
+                scope_summary={"allowed_checks": manifest_demo.allowed_checks},
+                observations=riwayat_observasi,
+                remaining_budget={
+                    "steps": keadaan_scan.max_steps - keadaan_scan.steps_taken,
+                    "requests": keadaan_scan.max_requests - keadaan_scan.requests_used,
+                },
+            )
+            aksi = PlannerAgen.pilih_aksi_berikutnya(konteks)
+            if aksi is None:
+                break
             audit_logger.log_action_proposed(aksi.tool_name, aksi.arguments, aksi.rationale)
             keputusan = PolicyEngine.evaluasi(aksi, manifest_demo, keadaan_scan)
             if keputusan.allowed:
                 audit_logger.log_action_allowed(aksi.tool_name, keputusan.reason, aksi.evasion_level)
+                keadaan_scan.steps_taken += 1
+                keadaan_scan.requests_used += 1
             else:
                 audit_logger.log_action_denied(aksi.tool_name, keputusan.reason)
+            obs = Observation(
+                id=f"obs-{keadaan_scan.steps_taken}",
+                action_id=aksi.tool_name,
+                type=aksi.tool_name,
+                target_url=url_target_lab,
+                evidence_ref=keputusan.reason,
+            )
+            riwayat_observasi.append(model_ke_dict(obs))
             status_teks = "Diizinkan" if keputusan.allowed else "Ditolak"
             print(f"  {status_teks}: {aksi.tool_name} ({keputusan.reason})")
 
